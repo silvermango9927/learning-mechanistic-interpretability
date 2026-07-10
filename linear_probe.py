@@ -19,6 +19,7 @@ not the code.
 # ---------------------------------------------------------------------------
 # STEP 1: Imports & environment
 # ---------------------------------------------------------------------------
+import functools
 import torch
 import numpy as np
 from transformer_lens import HookedTransformer
@@ -159,3 +160,82 @@ test_resid = cache["resid_post", 6]
 test_last = test_resid[0, -1]
 test_feature = test_last.detach().cpu().numpy().reshape(1, -1)
 print(probe.predict(test_feature), probe.predict_proba(test_feature))
+
+
+# ---------------------------------------------------------------------------
+# TEST B: STEERING VECTOR
+# ---------------------------------------------------------------------------
+# Instead of READING the sentiment direction (the probe), we now WRITE it back
+# into the model and watch its behaviour change.
+#
+# STEP 8: Build the steering vector = mean(positive activations) - mean(negative)
+# tensor_features is [40, 768]: rows 0:20 are positive, rows 20:40 are negative.
+# Result shape: [768]. It stays on mps (it came from tensor_features).
+steering_vector = tensor_features[0:20].mean(dim=0) - tensor_features[20:40].mean(dim=0)
+print(steering_vector.norm(), cache["resid_post", 6][0, -1].norm())
+
+# ---------------------------------------------------------------------------
+# STEP 9: The hook function
+# ---------------------------------------------------------------------------
+# TransformerLens calls this during the forward pass. `activation` is the live
+# residual stream at our hook point, shape [batch, pos, 768]. Whatever you
+# RETURN replaces it. functools.partial (below) binds the two extra args so the
+# signature TransformerLens actually calls is just (activation, hook).
+def steering_hook(activation, hook, steering_vector, coefficient):
+    activation = activation + coefficient * steering_vector
+    return activation
+
+
+coefficient = 8.0
+hook_name = "blocks.6.hook_resid_post"   # same point as cache["resid_post", 6]
+hook_fn = functools.partial(
+    steering_hook, steering_vector=steering_vector, coefficient=coefficient
+)
+
+
+# ---------------------------------------------------------------------------
+# STEP 10: Run WITH vs WITHOUT the hook and compare the next-token prediction
+# ---------------------------------------------------------------------------
+def top_next_tokens(logits, k=5):
+    top = logits[0, -1].topk(k).indices.tolist()
+    return [model.tokenizer.decode(idx) for idx in top]
+
+
+steer_prompt = "The movie I watched last night was"
+baseline_logits = model(steer_prompt)
+steered_logits = model.run_with_hooks(
+    steer_prompt,
+    fwd_hooks=[(hook_name, hook_fn)],
+)
+print("baseline:", top_next_tokens(baseline_logits))
+print("steered :", top_next_tokens(steered_logits))
+
+
+# ---------------------------------------------------------------------------
+# STEP 11: Coefficient sweep — how hard must we push, and when does it break?
+# ---------------------------------------------------------------------------
+# For each strength we rebuild the partial (a new coefficient baked in) and re-run.
+# c=0 is the CONTROL: 0 * steering_vector adds nothing, so it must match baseline.
+for c in [0, 4, 8, 16, 32, 64]:
+    swept_fn = functools.partial(
+        steering_hook, steering_vector=steering_vector, coefficient=c
+    )
+    swept_logits = model.run_with_hooks(steer_prompt, fwd_hooks=[(hook_name, swept_fn)])
+    print(f"c={c:>3}:", top_next_tokens(swept_logits))
+
+
+# ---------------------------------------------------------------------------
+# STEP 12: A better lens — generate a full continuation with steering ON
+# ---------------------------------------------------------------------------
+# Top-5 single next-token is a keyhole. A whole sentence makes sentiment obvious.
+# model.hooks(...) is a CONTEXT MANAGER: the hook stays registered for EVERY token
+# generated inside the `with` block, then auto-removes when the block exits.
+# do_sample=False = greedy (deterministic), so baseline vs steered is a fair compare.
+gen_fn = functools.partial(
+    steering_hook, steering_vector=steering_vector, coefficient=8.0
+)
+baseline_text = model.generate(steer_prompt, max_new_tokens=30, do_sample=False, verbose=False)
+with model.hooks(fwd_hooks=[(hook_name, gen_fn)]):
+    steered_text = model.generate(steer_prompt, max_new_tokens=30, do_sample=False, verbose=False)
+print("baseline text:", baseline_text)
+print("steered  text:", steered_text)
