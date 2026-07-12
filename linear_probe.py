@@ -216,7 +216,7 @@ print("steered :", top_next_tokens(steered_logits))
 # ---------------------------------------------------------------------------
 # For each strength we rebuild the partial (a new coefficient baked in) and re-run.
 # c=0 is the CONTROL: 0 * steering_vector adds nothing, so it must match baseline.
-for c in [0, 4, 8, 16, 32, 64]:
+for c in [0, 2, 4, 6, 8, 10, 12]:
     swept_fn = functools.partial(
         steering_hook, steering_vector=steering_vector, coefficient=c
     )
@@ -232,10 +232,30 @@ for c in [0, 4, 8, 16, 32, 64]:
 # generated inside the `with` block, then auto-removes when the block exits.
 # do_sample=False = greedy (deterministic), so baseline vs steered is a fair compare.
 gen_fn = functools.partial(
-    steering_hook, steering_vector=steering_vector, coefficient=8.0
+    steering_hook, steering_vector=steering_vector, coefficient=2.0
 )
 baseline_text = model.generate(steer_prompt, max_new_tokens=30, do_sample=False, verbose=False)
 with model.hooks(fwd_hooks=[(hook_name, gen_fn)]):
     steered_text = model.generate(steer_prompt, max_new_tokens=30, do_sample=False, verbose=False)
 print("baseline text:", baseline_text)
 print("steered  text:", steered_text)
+
+
+# ---------------------------------------------------------------------------
+# STEP 13: Sentiment, or "write-me-a-good-review"? Steer OFF-TOPIC prompts.
+# ---------------------------------------------------------------------------
+# Reuse the SAME gen_fn (coefficient=2.0). Only the prompt topic changes.
+#   - If every unrelated prompt STILL drifts into food/service/prices
+#     -> GPT-2's positive-review register (a property of the MODEL).
+#   - If each stays on its own topic but turns cheerful
+#     -> your steering vector is clean sentiment (your dataset design worked).
+offtopic_prompts = [
+    "The weather this morning is",
+    "My new programming job is",
+    "The history lecture today was",
+]
+for p in offtopic_prompts:
+    with model.hooks(fwd_hooks=[(hook_name, gen_fn)]):
+        out = model.generate(p, max_new_tokens=30, do_sample=False, verbose=False)
+    print(out)
+    print("-" * 60)
